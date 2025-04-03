@@ -22,6 +22,9 @@ func (b *bedrockProviderInitializer) ValidateConfig(config *ProviderConfig) erro
 	if len(config.awsAccessKey) == 0 || len(config.awsSecretKey) == 0 {
 		return errors.New("missing bedrock access authentication parameters")
 	}
+	if len(config.awsRegion) == 0 {
+		return errors.New("missing bedrock region parameters")
+	}
 	return nil
 }
 

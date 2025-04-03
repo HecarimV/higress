@@ -250,6 +250,9 @@ type ProviderConfig struct {
 	// @Title zh-CN Amazon Bedrock SecretKey for authorization
 	// @Description zh-CN 仅适用于Amazon Bedrock服务鉴权
 	awsSecretKey string `required:"false" yaml:"awsSecretKey" json:"awsSecretKey"`
+	// @Title zh-CN Amazon Bedrock Region
+	// @Description zh-CN 仅适用于Amazon Bedrock服务访问
+	awsRegion string `required:"false" yaml:"awsRegion" json:"awsRegion"`
 	// @Title zh-CN minimax API type
 	// @Description zh-CN 仅适用于 minimax 服务。minimax API 类型，v2 和 pro 中选填一项，默认值为 v2
 	minimaxApiType string `required:"false" yaml:"minimaxApiType" json:"minimaxApiType"`
@@ -356,6 +359,7 @@ func (c *ProviderConfig) FromJson(json gjson.Result) {
 	c.hunyuanAuthKey = json.Get("hunyuanAuthKey").String()
 	c.awsAccessKey = json.Get("awsAccessKey").String()
 	c.awsSecretKey = json.Get("awsSecretKey").String()
+	c.awsRegion = json.Get("awsRegion").String()
 	c.minimaxApiType = json.Get("minimaxApiType").String()
 	c.minimaxGroupId = json.Get("minimaxGroupId").String()
 	c.cloudflareAccountId = json.Get("cloudflareAccountId").String()
