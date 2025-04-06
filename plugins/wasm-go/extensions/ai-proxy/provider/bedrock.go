@@ -1,14 +1,27 @@
 package provider
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"github.com/higress-group/proxy-wasm-go-sdk/proxywasm"
 	"net/http"
+	"time"
 
 	"github.com/alibaba/higress/plugins/wasm-go/extensions/ai-proxy/util"
+	"github.com/alibaba/higress/plugins/wasm-go/pkg/log"
 	"github.com/alibaba/higress/plugins/wasm-go/pkg/wrapper"
+	"github.com/higress-group/proxy-wasm-go-sdk/proxywasm/types"
 )
 
 const (
+	httpPostMethod = "POST"
+	awsService     = "bedrock"
+	// bedrock-runtime.{awsRegion}.amazonaws.com
+	bedrockDefaultDomain = "bedrock-runtime.%s.amazonaws.com"
 	// converse路径 /model/{modelId}/converse
 	bedrockChatCompletionPath = "/model/%s/converse"
 	// converseStream路径 /model/{modelId}/converse-stream
@@ -57,8 +70,185 @@ func (b *bedrockProvider) OnRequestHeaders(ctx wrapper.HttpContext, apiName ApiN
 }
 
 func (b *bedrockProvider) TransformRequestHeaders(ctx wrapper.HttpContext, apiName ApiName, headers http.Header) {
-	util.OverwriteRequestAuthorizationHeader(headers, "")
-	if !b.config.IsOriginal() {
-		util.OverwriteRequestPathHeaderByCapability(headers, string(apiName), b.config.capabilities)
+	util.OverwriteRequestHostHeader(headers, fmt.Sprintf(bedrockDefaultDomain, b.config.awsRegion))
+}
+
+func (b *bedrockProvider) OnRequestBody(ctx wrapper.HttpContext, apiName ApiName, body []byte) (types.Action, error) {
+	if !b.config.isSupportedAPI(apiName) {
+		return types.ActionContinue, errUnsupportedApiName
 	}
+	return b.config.handleRequestBody(b, b.contextCache, ctx, apiName, body)
+}
+
+func (b *bedrockProvider) TransformRequestBodyHeaders(ctx wrapper.HttpContext, apiName ApiName, body []byte, headers http.Header) ([]byte, error) {
+	switch apiName {
+	case ApiNameChatCompletion:
+		return b.onChatCompletionRequestBody(ctx, body, headers)
+	default:
+		return b.config.defaultTransformRequestBody(ctx, apiName, body)
+	}
+}
+
+func (b *bedrockProvider) onChatCompletionRequestBody(ctx wrapper.HttpContext, body []byte, headers http.Header) ([]byte, error) {
+	request := &chatCompletionRequest{}
+	err := b.config.parseRequestAndMapModel(ctx, request, body)
+	if err != nil {
+		return nil, err
+	}
+
+	streaming := request.Stream
+	if streaming {
+		headers.Set("Accept", "text/event-stream")
+	} else {
+		headers.Set("Accept", "*/*")
+	}
+	return b.buildBedrockTextGenerationRequest(request)
+}
+
+func (b *bedrockProvider) buildBedrockTextGenerationRequest(origRequest *chatCompletionRequest) ([]byte, error) {
+	messages := make([]bedrockMessage, 0, len(origRequest.Messages))
+	for i := range origRequest.Messages {
+		messages = append(messages, chatMessage2BedrockMessage(origRequest.Messages[i]))
+	}
+	request := &bedrockTextGenRequest{
+		Messages: messages,
+		InferenceConfig: bedrockInferenceConfig{
+			MaxTokens:   origRequest.MaxTokens,
+			Temperature: origRequest.Temperature,
+			TopP:        origRequest.TopP,
+		},
+		AdditionalModelRequestFields: map[string]interface{}{},
+		PerformanceConfig: PerformanceConfiguration{
+			Latency: "standard",
+		},
+	}
+	return json.Marshal(request)
+}
+
+type bedrockTextGenRequest struct {
+	Messages                     []bedrockMessage         `json:"messages"`
+	System                       any                      `json:"system,omitempty"`
+	InferenceConfig              bedrockInferenceConfig   `json:"inferenceConfig,omitempty"`
+	AdditionalModelRequestFields map[string]interface{}   `json:"additionalModelRequestFields,omitempty"`
+	PerformanceConfig            PerformanceConfiguration `json:"performanceConfig,omitempty"`
+}
+
+type PerformanceConfiguration struct {
+	Latency string `json:"latency,omitempty"`
+}
+
+type bedrockMessage struct {
+	Role    string                  `json:"role"`
+	Content []bedrockMessageContent `json:"content"`
+}
+
+type bedrockMessageContent struct {
+	Text  string     `json:"text,omitempty"`
+	Image imageBlock `json:"image,omitempty"`
+}
+
+type imageBlock struct {
+	Format string      `json:"format,omitempty"`
+	Source imageSource `json:"source,omitempty"`
+}
+
+type imageSource struct {
+	Bytes string `json:"bytes,omitempty"`
+}
+
+type bedrockInferenceConfig struct {
+	StopSequences []string `json:"stopSequences,omitempty"`
+	MaxTokens     int      `json:"max_tokens,omitempty"`
+	Temperature   float64  `json:"temperature,omitempty"`
+	TopP          float64  `json:"top_p,omitempty"`
+}
+
+func chatMessage2BedrockMessage(chatMessage chatMessage) bedrockMessage {
+	if chatMessage.IsStringContent() {
+		return bedrockMessage{
+			Role:    chatMessage.Role,
+			Content: []bedrockMessageContent{{Text: chatMessage.StringContent()}},
+		}
+	} else {
+		var contents []bedrockMessageContent
+		openaiContent := chatMessage.ParseContent()
+		for _, part := range openaiContent {
+			var content bedrockMessageContent
+			if part.Type == contentTypeText {
+				content.Text = part.Text
+			} else {
+				log.Warnf("imageUrl is not supported: %s", part.Type)
+				continue
+			}
+			contents = append(contents, content)
+		}
+		return bedrockMessage{
+			Role:    chatMessage.Role,
+			Content: contents,
+		}
+	}
+}
+
+// 设置HTTP请求头
+func (b *bedrockProvider) setAuthHeaders(body []byte) {
+	t := time.Now().UTC()
+	amzDate := t.Format("20060102T150405Z")
+	dateStamp := t.Format("20060102")
+	signature := b.generateSignature("", amzDate, dateStamp, body)
+	_ = proxywasm.ReplaceHttpRequestHeader("X-Amz-Date", amzDate)
+	_ = proxywasm.ReplaceHttpRequestHeader("Authorization", fmt.Sprintf("AWS4-HMAC-SHA256 Credential=%s/%s/%s/%s/aws4_request, SignedHeaders=host;x-amz-date, Signature=%s", b.config.awsAccessKey, dateStamp, b.config.awsRegion, awsService, signature))
+}
+
+// 生成签名核心逻辑
+func (b *bedrockProvider) generateSignature(path, amzDate, dateStamp string, body []byte) string {
+	// 1. 哈希请求体
+	hashedPayload := sha256Hex(body)
+
+	// 2. 生成规范请求
+	endpoint := fmt.Sprintf(bedrockDefaultDomain, b.config.awsRegion)
+	canonicalHeaders := fmt.Sprintf("host:%s\nx-amz-date:%s\n", endpoint, amzDate)
+	signedHeaders := "host;x-amz-date"
+	canonicalRequest := fmt.Sprintf("%s\n%s\n\n%s\n%s\n%s",
+		httpPostMethod, path, canonicalHeaders, signedHeaders, hashedPayload)
+
+	// 3. 生成待签字符串
+	credentialScope := fmt.Sprintf("%s/%s/%s/aws4_request", dateStamp, b.config.awsRegion, awsService)
+	hashedCanonReq := sha256Hex([]byte(canonicalRequest))
+	stringToSign := fmt.Sprintf("AWS4-HMAC-SHA256\n%s\n%s\n%s",
+		amzDate, credentialScope, hashedCanonReq)
+
+	// 4. 计算签名
+	signingKey := getSignatureKey(b.config.awsSecretKey, dateStamp, b.config.awsRegion, awsService)
+	signature := hmacHex(signingKey, stringToSign)
+	return signature
+}
+
+// 辅助函数：生成HMAC签名密钥链
+func getSignatureKey(key, dateStamp, region, service string) []byte {
+	kDate := hmacSha256([]byte("AWS4"+key), dateStamp)
+	kRegion := hmacSha256(kDate, region)
+	kService := hmacSha256(kRegion, service)
+	kSigning := hmacSha256(kService, "aws4_request")
+	return kSigning
+}
+
+// HMAC-SHA256 计算
+func hmacSha256(key []byte, data string) []byte {
+	h := hmac.New(sha256.New, key)
+	h.Write([]byte(data))
+	return h.Sum(nil)
+}
+
+// 计算SHA256十六进制
+func sha256Hex(data []byte) string {
+	h := sha256.New()
+	h.Write(data)
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// HMAC十六进制输出
+func hmacHex(key []byte, data string) string {
+	h := hmac.New(sha256.New, key)
+	h.Write([]byte(data))
+	return hex.EncodeToString(h.Sum(nil))
 }
