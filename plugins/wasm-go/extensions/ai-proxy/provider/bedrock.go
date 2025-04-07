@@ -80,6 +80,23 @@ func (b *bedrockProvider) OnRequestBody(ctx wrapper.HttpContext, apiName ApiName
 	return b.config.handleRequestBody(b, b.contextCache, ctx, apiName, body)
 }
 
+func (b *bedrockProvider) insertHttpContextMessage(body []byte, content string, onlyOneSystemBeforeFile bool) ([]byte, error) {
+	request := &bedrockTextGenRequest{}
+	if err := json.Unmarshal(body, request); err != nil {
+		return nil, fmt.Errorf("unable to unmarshal request: %v", err)
+	}
+
+	if len(request.System) > 0 {
+		request.System = append(request.System, systemContentBlock{Text: content})
+	} else {
+		request.System = []systemContentBlock{{Text: content}}
+	}
+
+	requestBytes, err := json.Marshal(request)
+	b.setAuthHeaders(requestBytes, nil)
+	return requestBytes, err
+}
+
 func (b *bedrockProvider) TransformRequestBodyHeaders(ctx wrapper.HttpContext, apiName ApiName, body []byte, headers http.Header) ([]byte, error) {
 	switch apiName {
 	case ApiNameChatCompletion:
@@ -99,13 +116,15 @@ func (b *bedrockProvider) onChatCompletionRequestBody(ctx wrapper.HttpContext, b
 	streaming := request.Stream
 	if streaming {
 		headers.Set("Accept", "text/event-stream")
+		util.OverwriteRequestPathHeader(headers, fmt.Sprintf(bedrockStreamChatCompletionPath, request.Model))
 	} else {
 		headers.Set("Accept", "*/*")
+		util.OverwriteRequestPathHeader(headers, fmt.Sprintf(bedrockChatCompletionPath, request.Model))
 	}
-	return b.buildBedrockTextGenerationRequest(request)
+	return b.buildBedrockTextGenerationRequest(request, headers)
 }
 
-func (b *bedrockProvider) buildBedrockTextGenerationRequest(origRequest *chatCompletionRequest) ([]byte, error) {
+func (b *bedrockProvider) buildBedrockTextGenerationRequest(origRequest *chatCompletionRequest, headers http.Header) ([]byte, error) {
 	messages := make([]bedrockMessage, 0, len(origRequest.Messages))
 	for i := range origRequest.Messages {
 		messages = append(messages, chatMessage2BedrockMessage(origRequest.Messages[i]))
@@ -122,12 +141,14 @@ func (b *bedrockProvider) buildBedrockTextGenerationRequest(origRequest *chatCom
 			Latency: "standard",
 		},
 	}
-	return json.Marshal(request)
+	requestBytes, err := json.Marshal(request)
+	b.setAuthHeaders(requestBytes, headers)
+	return requestBytes, err
 }
 
 type bedrockTextGenRequest struct {
 	Messages                     []bedrockMessage         `json:"messages"`
-	System                       any                      `json:"system,omitempty"`
+	System                       []systemContentBlock     `json:"system,omitempty"`
 	InferenceConfig              bedrockInferenceConfig   `json:"inferenceConfig,omitempty"`
 	AdditionalModelRequestFields map[string]interface{}   `json:"additionalModelRequestFields,omitempty"`
 	PerformanceConfig            PerformanceConfiguration `json:"performanceConfig,omitempty"`
@@ -145,6 +166,10 @@ type bedrockMessage struct {
 type bedrockMessageContent struct {
 	Text  string     `json:"text,omitempty"`
 	Image imageBlock `json:"image,omitempty"`
+}
+
+type systemContentBlock struct {
+	Text string `json:"text,omitempty"`
 }
 
 type imageBlock struct {
@@ -189,41 +214,40 @@ func chatMessage2BedrockMessage(chatMessage chatMessage) bedrockMessage {
 	}
 }
 
-// 设置HTTP请求头
-func (b *bedrockProvider) setAuthHeaders(body []byte) {
+func (b *bedrockProvider) setAuthHeaders(body []byte, headers http.Header) {
 	t := time.Now().UTC()
 	amzDate := t.Format("20060102T150405Z")
 	dateStamp := t.Format("20060102")
-	signature := b.generateSignature("", amzDate, dateStamp, body)
-	_ = proxywasm.ReplaceHttpRequestHeader("X-Amz-Date", amzDate)
-	_ = proxywasm.ReplaceHttpRequestHeader("Authorization", fmt.Sprintf("AWS4-HMAC-SHA256 Credential=%s/%s/%s/%s/aws4_request, SignedHeaders=host;x-amz-date, Signature=%s", b.config.awsAccessKey, dateStamp, b.config.awsRegion, awsService, signature))
+	path, _ := proxywasm.GetHttpRequestHeader(":path")
+	signature := b.generateSignature(path, amzDate, dateStamp, body)
+	if headers != nil {
+		headers.Set("X-Amz-Date", amzDate)
+		headers.Set("Authorization", fmt.Sprintf("AWS4-HMAC-SHA256 Credential=%s/%s/%s/%s/aws4_request, SignedHeaders=host;x-amz-date, Signature=%s", b.config.awsAccessKey, dateStamp, b.config.awsRegion, awsService, signature))
+	} else {
+		_ = proxywasm.ReplaceHttpRequestHeader("X-Amz-Date", amzDate)
+		_ = proxywasm.ReplaceHttpRequestHeader("Authorization", fmt.Sprintf("AWS4-HMAC-SHA256 Credential=%s/%s/%s/%s/aws4_request, SignedHeaders=host;x-amz-date, Signature=%s", b.config.awsAccessKey, dateStamp, b.config.awsRegion, awsService, signature))
+	}
 }
 
-// 生成签名核心逻辑
 func (b *bedrockProvider) generateSignature(path, amzDate, dateStamp string, body []byte) string {
-	// 1. 哈希请求体
 	hashedPayload := sha256Hex(body)
 
-	// 2. 生成规范请求
 	endpoint := fmt.Sprintf(bedrockDefaultDomain, b.config.awsRegion)
 	canonicalHeaders := fmt.Sprintf("host:%s\nx-amz-date:%s\n", endpoint, amzDate)
 	signedHeaders := "host;x-amz-date"
 	canonicalRequest := fmt.Sprintf("%s\n%s\n\n%s\n%s\n%s",
 		httpPostMethod, path, canonicalHeaders, signedHeaders, hashedPayload)
 
-	// 3. 生成待签字符串
 	credentialScope := fmt.Sprintf("%s/%s/%s/aws4_request", dateStamp, b.config.awsRegion, awsService)
 	hashedCanonReq := sha256Hex([]byte(canonicalRequest))
 	stringToSign := fmt.Sprintf("AWS4-HMAC-SHA256\n%s\n%s\n%s",
 		amzDate, credentialScope, hashedCanonReq)
 
-	// 4. 计算签名
 	signingKey := getSignatureKey(b.config.awsSecretKey, dateStamp, b.config.awsRegion, awsService)
 	signature := hmacHex(signingKey, stringToSign)
 	return signature
 }
 
-// 辅助函数：生成HMAC签名密钥链
 func getSignatureKey(key, dateStamp, region, service string) []byte {
 	kDate := hmacSha256([]byte("AWS4"+key), dateStamp)
 	kRegion := hmacSha256(kDate, region)
@@ -232,21 +256,18 @@ func getSignatureKey(key, dateStamp, region, service string) []byte {
 	return kSigning
 }
 
-// HMAC-SHA256 计算
 func hmacSha256(key []byte, data string) []byte {
 	h := hmac.New(sha256.New, key)
 	h.Write([]byte(data))
 	return h.Sum(nil)
 }
 
-// 计算SHA256十六进制
 func sha256Hex(data []byte) string {
 	h := sha256.New()
 	h.Write(data)
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-// HMAC十六进制输出
 func hmacHex(key []byte, data string) string {
 	h := hmac.New(sha256.New, key)
 	h.Write([]byte(data))
