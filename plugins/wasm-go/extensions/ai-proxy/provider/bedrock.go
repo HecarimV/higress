@@ -7,13 +7,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/higress-group/proxy-wasm-go-sdk/proxywasm"
 	"net/http"
 	"time"
 
 	"github.com/alibaba/higress/plugins/wasm-go/extensions/ai-proxy/util"
 	"github.com/alibaba/higress/plugins/wasm-go/pkg/log"
 	"github.com/alibaba/higress/plugins/wasm-go/pkg/wrapper"
+	"github.com/higress-group/proxy-wasm-go-sdk/proxywasm"
 	"github.com/higress-group/proxy-wasm-go-sdk/proxywasm/types"
 )
 
@@ -106,6 +106,27 @@ func (b *bedrockProvider) TransformRequestBodyHeaders(ctx wrapper.HttpContext, a
 	}
 }
 
+func (b *bedrockProvider) TransformResponseBody(ctx wrapper.HttpContext, apiName ApiName, body []byte) ([]byte, error) {
+	if apiName == ApiNameChatCompletion {
+		return b.onChatCompletionResponseBody(ctx, body)
+	}
+	return nil, errUnsupportedApiName
+}
+
+func (b *bedrockProvider) OnStreamingEvent(ctx wrapper.HttpContext, name ApiName, event StreamEvent) ([]StreamEvent, error) {
+	var outputEvents []StreamEvent
+	return outputEvents, nil
+}
+
+func (b *bedrockProvider) onChatCompletionResponseBody(ctx wrapper.HttpContext, body []byte) ([]byte, error) {
+	bedrockResponse := &bedrockConverseResponse{}
+	if err := json.Unmarshal(body, bedrockResponse); err != nil {
+		return nil, fmt.Errorf("unable to unmarshal bedrock response: %v", err)
+	}
+	response := b.buildChatCompletionResponse(ctx, bedrockResponse)
+	return json.Marshal(response)
+}
+
 func (b *bedrockProvider) onChatCompletionRequestBody(ctx wrapper.HttpContext, body []byte, headers http.Header) ([]byte, error) {
 	request := &chatCompletionRequest{}
 	err := b.config.parseRequestAndMapModel(ctx, request, body)
@@ -144,6 +165,37 @@ func (b *bedrockProvider) buildBedrockTextGenerationRequest(origRequest *chatCom
 	requestBytes, err := json.Marshal(request)
 	b.setAuthHeaders(requestBytes, headers)
 	return requestBytes, err
+}
+
+func (m *bedrockProvider) buildChatCompletionResponse(ctx wrapper.HttpContext, bedrockResponse *bedrockConverseResponse) *chatCompletionResponse {
+	var outputContent string
+	if len(bedrockResponse.Output.Message.Content) > 0 {
+		outputContent = bedrockResponse.Output.Message.Content[0].Text
+	}
+	choices := []chatCompletionChoice{
+		{
+			Index: 0,
+			Message: &chatMessage{
+				Role:    bedrockResponse.Output.Message.Role,
+				Content: outputContent,
+			},
+			FinishReason: bedrockResponse.StopReason,
+		},
+	}
+	requestId, _ := proxywasm.GetHttpResponseHeader("x-amzn-requestid")
+	return &chatCompletionResponse{
+		Id:                requestId,
+		Created:           time.Now().UnixMilli() / 1000,
+		Model:             ctx.GetStringContext(ctxKeyFinalRequestModel, ""),
+		SystemFingerprint: "",
+		Object:            objectChatCompletion,
+		Choices:           choices,
+		Usage: usage{
+			PromptTokens:     bedrockResponse.Usage.InputTokens,
+			CompletionTokens: bedrockResponse.Usage.OutputTokens,
+			TotalTokens:      bedrockResponse.Usage.TotalTokens,
+		},
+	}
 }
 
 type bedrockTextGenRequest struct {
@@ -186,6 +238,39 @@ type bedrockInferenceConfig struct {
 	MaxTokens     int      `json:"max_tokens,omitempty"`
 	Temperature   float64  `json:"temperature,omitempty"`
 	TopP          float64  `json:"top_p,omitempty"`
+}
+
+type bedrockConverseResponse struct {
+	Metrics    converseMetrics             `json:"metrics"`
+	Output     converseOutputMemberMessage `json:"output"`
+	StopReason string                      `json:"stopReason"`
+	Usage      tokenUsage                  `json:"usage"`
+}
+
+type converseMetrics struct {
+	LatencyMs int `json:"latencyMs"`
+}
+
+type converseOutputMemberMessage struct {
+	Message message `json:"message"`
+}
+
+type message struct {
+	Content []contentBlockMemberText `json:"content"`
+
+	Role string `json:"role"`
+}
+
+type contentBlockMemberText struct {
+	Text string `json:"text"`
+}
+
+type tokenUsage struct {
+	InputTokens int `json:"inputTokens,omitempty"`
+
+	OutputTokens int `json:"outputTokens,omitempty"`
+
+	TotalTokens int `json:"totalTokens"`
 }
 
 func chatMessage2BedrockMessage(chatMessage chatMessage) bedrockMessage {
