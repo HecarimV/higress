@@ -58,6 +58,7 @@ const (
 	LLMServiceDuration     = "llm_service_duration"
 	LLMDurationCount       = "llm_duration_count"
 	LLMStreamDurationCount = "llm_stream_duration_count"
+	LLMTotalRequestsCount  = "llm_total_requests_count"
 	ResponseType           = "response_type"
 	ChatID                 = "chat_id"
 	ChatRound              = "chat_round"
@@ -245,6 +246,9 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config AIStatisticsConfig, body 
 
 	// Write log
 	ctx.WriteUserAttributeToLogWithKey(wrapper.AILogKey)
+
+	// Record total request
+	writeRqTotalMetric(ctx, config, requestModel)
 	return types.ActionContinue
 }
 
@@ -551,4 +555,11 @@ func convertToUInt(val interface{}) (uint64, bool) {
 	default:
 		return 0, false
 	}
+}
+
+func writeRqTotalMetric(ctx wrapper.HttpContext, config AIStatisticsConfig, model string) {
+	consumer := ctx.GetStringContext(ConsumerKey, "none")
+	route := ctx.GetStringContext(RouteName, "none")
+	cluster := ctx.GetStringContext(ClusterName, "none")
+	config.incrementCounter(generateMetricName(route, cluster, model, consumer, LLMTotalRequestsCount), 1)
 }
