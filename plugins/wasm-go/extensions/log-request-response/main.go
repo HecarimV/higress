@@ -195,15 +195,13 @@ func processStreamingBody(
 		if remainingCapacity > 0 {
 			if len(chunk) <= remainingCapacity {
 				buffer = append(buffer, chunk...)
-				ctx.SetContext(bufferKey, buffer)
 			} else {
 				buffer = append(buffer, chunk[:remainingCapacity]...)
 				// reach max size, record and clear
 				bodyStr := string(buffer)
 				setPropertyWithMarshal(logKey, bodyStr)
-				// clear buffer
-				ctx.SetContext(bufferKey, []byte{})
 			}
+			ctx.SetContext(bufferKey, buffer)
 		}
 	}
 
